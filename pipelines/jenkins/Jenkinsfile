@@ -1,0 +1,280 @@
+pipeline {
+    agent {
+        docker {
+            // Usando la imagen oficial de AWS CLI
+            image 'public.ecr.aws/aws-cli/aws-cli:latest'
+            args '--entrypoint=""'
+        }
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        CLUSTER_STACK = 'ecs-cluster-stack'
+        ALB_STACK = 'alb-stack'
+        SERVICE_STACK = 'nginx-service-stack'
+    }
+
+    triggers {
+        // Webhook trigger from GitLab
+        gitlab(
+            triggerOnPush: true,
+            triggerOnMergeRequest: true,
+            branchFilterType: 'All',
+            secretToken: env.GITLAB_WEBHOOK_SECRET
+        )
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code...'
+                checkout scm
+            }
+        }
+
+        stage('Validate Templates') {
+            steps {
+                script {
+                    withAWS(credentials: 'aws-credentials-id', region: env.AWS_DEFAULT_REGION) {
+                        echo 'Validating CloudFormation templates...'
+
+                        sh '''
+                            aws cloudformation validate-template \
+                                --template-body file://clusters/ecs-cluster.json
+
+                            aws cloudformation validate-template \
+                                --template-body file://loadbalancers/nginx-alb.json
+
+                            aws cloudformation validate-template \
+                                --template-body file://services/nginx-service.json
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Infrastructure') {
+            when {
+                branch 'main'
+            }
+            stages {
+                stage('Deploy ECS Cluster') {
+                    steps {
+                        script {
+                            withAWS(credentials: 'aws-credentials-id', region: env.AWS_DEFAULT_REGION) {
+                                echo 'Deploying ECS Cluster...'
+                                sh '''
+                                    aws cloudformation deploy \
+                                        --stack-name ${CLUSTER_STACK} \
+                                        --template-file clusters/ecs-cluster.json \
+                                        --parameter-overrides \
+                                            ClusterName=nginx-production-cluster \
+                                            EnableContainerInsights=enabled \
+                                        --capabilities CAPABILITY_NAMED_IAM \
+                                        --no-fail-on-empty-changeset \
+                                        --tags Environment=Production ManagedBy=Jenkins
+                                '''
+                            }
+                        }
+                    }
+                }
+
+                stage('Get Network Configuration') {
+                    steps {
+                        script {
+                            withAWS(credentials: 'aws-credentials-id', region: env.AWS_DEFAULT_REGION) {
+                                echo 'Getting VPC and Subnet information...'
+
+                                env.VPC_ID = sh(
+                                    script: '''
+                                        aws ec2 describe-vpcs \
+                                            --filters "Name=is-default,Values=true" \
+                                            --query "Vpcs[0].VpcId" \
+                                            --output text
+                                    ''',
+                                    returnStdout: true
+                                ).trim()
+
+                                env.PUBLIC_SUBNETS = sh(
+                                    script: '''
+                                        aws ec2 describe-subnets \
+                                            --filters "Name=vpc-id,Values=${VPC_ID}" "Name=map-public-ip-on-launch,Values=true" \
+                                            --query "Subnets[0:2].SubnetId" \
+                                            --output text | tr '\t' ','
+                                    ''',
+                                    returnStdout: true
+                                ).trim()
+
+                                def privateSubnets = sh(
+                                    script: '''
+                                        aws ec2 describe-subnets \
+                                            --filters "Name=vpc-id,Values=${VPC_ID}" "Name=map-public-ip-on-launch,Values=false" \
+                                            --query "Subnets[0:2].SubnetId" \
+                                            --output text | tr '\t' ','
+                                    ''',
+                                    returnStdout: true
+                                ).trim()
+
+                                env.PRIVATE_SUBNETS = privateSubnets ?: env.PUBLIC_SUBNETS
+
+                                echo "VPC ID: ${env.VPC_ID}"
+                                echo "Public Subnets: ${env.PUBLIC_SUBNETS}"
+                                echo "Private Subnets: ${env.PRIVATE_SUBNETS}"
+                            }
+                        }
+                    }
+                }
+
+                stage('Deploy Application Load Balancer') {
+                    steps {
+                        script {
+                            withAWS(credentials: 'aws-credentials-id', region: env.AWS_DEFAULT_REGION) {
+                                echo 'Deploying Application Load Balancer...'
+                                sh '''
+                                    aws cloudformation deploy \
+                                        --stack-name ${ALB_STACK} \
+                                        --template-file loadbalancers/nginx-alb.json \
+                                        --parameter-overrides \
+                                            VpcId=${VPC_ID} \
+                                            PublicSubnets=${PUBLIC_SUBNETS} \
+                                            CertificateArn="" \
+                                        --capabilities CAPABILITY_NAMED_IAM \
+                                        --no-fail-on-empty-changeset \
+                                        --tags Environment=Production ManagedBy=Jenkins
+                                '''
+                            }
+                        }
+                    }
+                }
+
+                stage('Register Task Definition') {
+                    steps {
+                        script {
+                            withAWS(credentials: 'aws-credentials-id', region: env.AWS_DEFAULT_REGION) {
+                                echo 'Registering Task Definition...'
+
+                                def accountId = sh(
+                                    script: 'aws sts get-caller-identity --query Account --output text',
+                                    returnStdout: true
+                                ).trim()
+
+                                sh """
+                                    # Replace placeholders in task definition
+                                    sed -e 's/\\\${AWS_ACCOUNT_ID}/${accountId}/g' \
+                                        -e 's/\\\${AWS_REGION}/${AWS_DEFAULT_REGION}/g' \
+                                        -e 's/\\\${EFS_ID}/fs-12345678/g' \
+                                        -e 's/\\\${EFS_ACCESS_POINT_CONFIG}/fsap-config123/g' \
+                                        -e 's/\\\${EFS_ACCESS_POINT_HTML}/fsap-html456/g' \
+                                        task-definitions/nginx-task.json > /tmp/nginx-task-resolved.json
+
+                                    # Register the task definition
+                                    TASK_DEF_ARN=\$(aws ecs register-task-definition \
+                                        --cli-input-json file:///tmp/nginx-task-resolved.json \
+                                        --query 'taskDefinition.taskDefinitionArn' \
+                                        --output text)
+
+                                    echo "Task Definition ARN: \$TASK_DEF_ARN"
+                                    echo \$TASK_DEF_ARN > /tmp/task-def-arn.txt
+                                """
+
+                                env.TASK_DEF_ARN = readFile('/tmp/task-def-arn.txt').trim()
+                            }
+                        }
+                    }
+                }
+
+                stage('Deploy ECS Service') {
+                    steps {
+                        script {
+                            withAWS(credentials: 'aws-credentials-id', region: env.AWS_DEFAULT_REGION) {
+                                echo 'Deploying ECS Service...'
+                                sh '''
+                                    aws cloudformation deploy \
+                                        --stack-name ${SERVICE_STACK} \
+                                        --template-file services/nginx-service.json \
+                                        --parameter-overrides \
+                                            ClusterStackName=${CLUSTER_STACK} \
+                                            ALBStackName=${ALB_STACK} \
+                                            VpcId=${VPC_ID} \
+                                            PrivateSubnets=${PRIVATE_SUBNETS} \
+                                            TaskDefinitionArn=${TASK_DEF_ARN} \
+                                            DesiredCount=2 \
+                                            MinCapacity=1 \
+                                            MaxCapacity=4 \
+                                        --capabilities CAPABILITY_NAMED_IAM \
+                                        --no-fail-on-empty-changeset \
+                                        --tags Environment=Production ManagedBy=Jenkins
+                                '''
+                            }
+                        }
+                    }
+                }
+
+                stage('Verify Deployment') {
+                    steps {
+                        script {
+                            withAWS(credentials: 'aws-credentials-id', region: env.AWS_DEFAULT_REGION) {
+                                echo 'Getting Load Balancer DNS...'
+
+                                def albDns = sh(
+                                    script: '''
+                                        aws cloudformation describe-stacks \
+                                            --stack-name ${ALB_STACK} \
+                                            --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerDNS'].OutputValue" \
+                                            --output text
+                                    ''',
+                                    returnStdout: true
+                                ).trim()
+
+                                echo """
+                                ========================================
+                                🚀 Deployment completed successfully!
+                                ========================================
+                                📡 Application available at:
+                                  - HTTP: http://${albDns}
+                                  - Alternative port: http://${albDns}:8080
+                                  - HTTPS: https://${albDns} (certificate required)
+                                ========================================
+                                """
+
+                                // Wait for service to be stable
+                                sh '''
+                                    echo "Waiting for service to stabilize..."
+                                    aws ecs wait services-stable \
+                                        --cluster nginx-production-cluster \
+                                        --services nginx-service \
+                                        --region ${AWS_DEFAULT_REGION} || echo "Service check timed out"
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '✅ Pipeline completed successfully!'
+            // Send notification to Slack/Email
+            // slackSend(channel: '#deployments', message: "Deployment successful: ${env.BUILD_URL}")
+        }
+        failure {
+            echo '❌ Pipeline failed!'
+            script {
+                withAWS(credentials: 'aws-credentials-id', region: env.AWS_DEFAULT_REGION) {
+                    sh '''
+                        echo "Attempting to rollback service stack..."
+                        aws cloudformation cancel-update-stack \
+                            --stack-name ${SERVICE_STACK} || true
+                    '''
+                }
+            }
+            // Send notification to Slack/Email
+            // slackSend(channel: '#deployments', message: "Deployment failed: ${env.BUILD_URL}", color: 'danger')
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

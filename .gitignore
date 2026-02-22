@@ -1,0 +1,95 @@
+# AWS credentials and sensitive files
+.aws/
+*.pem
+*.key
+*.crt
+credentials
+config
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+*.sublime-*
+.project
+.classpath
+.settings/
+
+# Logs
+*.log
+logs/
+temp/
+tmp/
+
+# CloudFormation
+*.template-e
+packaged-*.yaml
+samconfig.toml
+
+# Terraform (if used later)
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+!example.tfvars
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+
+# Docker
+docker-compose.override.yml
+.dockerignore.local
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Test coverage
+coverage/
+*.lcov
+.nyc_output/
+
+# Build artifacts
+dist/
+build/
+out/
+target/
+
+# Jenkins
+jenkins-cli.jar
+jenkins.war
+
+# Local configuration
+local-config/
+*.local
+
+# Temporary files
+*.tmp
+*.temp

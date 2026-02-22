@@ -1,0 +1,233 @@
+name: Deploy to AWS ECS
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    types: [ closed ]
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_STACK: ecs-cluster-stack
+  ALB_STACK: alb-stack
+  SERVICE_STACK: nginx-service-stack
+
+jobs:
+  validate:
+    name: Validate CloudFormation Templates
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == false)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate Cluster Template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://clusters/ecs-cluster.json
+
+      - name: Validate ALB Template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://loadbalancers/nginx-alb.json
+
+      - name: Validate Service Template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://services/nginx-service.json
+
+  deploy:
+    name: Deploy Infrastructure to AWS
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true))
+
+    container:
+      # Usando la imagen oficial de AWS CLI
+      image: public.ecr.aws/aws-cli/aws-cli:latest
+      options: --entrypoint ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install additional tools
+        run: |
+          yum install -y jq git
+
+      - name: Configure AWS credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          aws sts get-caller-identity
+          echo "AWS CLI configured successfully"
+
+      - name: Deploy ECS Cluster
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          echo "Deploying ECS Cluster..."
+          aws cloudformation deploy \
+            --stack-name ${{ env.CLUSTER_STACK }} \
+            --template-file clusters/ecs-cluster.json \
+            --parameter-overrides \
+              ClusterName=nginx-production-cluster \
+              EnableContainerInsights=enabled \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --tags Environment=Production ManagedBy=GitHubActions
+
+      - name: Get VPC and Subnet information
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        id: network
+        run: |
+          # Get default VPC ID
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=is-default,Values=true" \
+            --query "Vpcs[0].VpcId" \
+            --output text)
+          echo "VPC_ID=$VPC_ID" >> $GITHUB_OUTPUT
+
+          # Get public subnets (at least 2 for ALB)
+          PUBLIC_SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=map-public-ip-on-launch,Values=true" \
+            --query "Subnets[0:2].SubnetId" \
+            --output text | tr '\t' ',')
+          echo "PUBLIC_SUBNETS=$PUBLIC_SUBNETS" >> $GITHUB_OUTPUT
+
+          # Get private subnets (if available, else use public)
+          PRIVATE_SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=map-public-ip-on-launch,Values=false" \
+            --query "Subnets[0:2].SubnetId" \
+            --output text | tr '\t' ',')
+
+          if [ -z "$PRIVATE_SUBNETS" ]; then
+            PRIVATE_SUBNETS=$PUBLIC_SUBNETS
+          fi
+          echo "PRIVATE_SUBNETS=$PRIVATE_SUBNETS" >> $GITHUB_OUTPUT
+
+      - name: Deploy Application Load Balancer
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          echo "Deploying Application Load Balancer..."
+          aws cloudformation deploy \
+            --stack-name ${{ env.ALB_STACK }} \
+            --template-file loadbalancers/nginx-alb.json \
+            --parameter-overrides \
+              VpcId=${{ steps.network.outputs.VPC_ID }} \
+              PublicSubnets=${{ steps.network.outputs.PUBLIC_SUBNETS }} \
+              CertificateArn="" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --tags Environment=Production ManagedBy=GitHubActions
+
+      - name: Register Task Definition
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        id: task-def
+        run: |
+          echo "Registering Task Definition..."
+
+          # Replace placeholders in task definition
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          # Create a temporary task definition file with actual values
+          sed -e "s/\${AWS_ACCOUNT_ID}/$ACCOUNT_ID/g" \
+              -e "s/\${AWS_REGION}/${{ env.AWS_REGION }}/g" \
+              -e "s/\${EFS_ID}/fs-12345678/g" \
+              -e "s/\${EFS_ACCESS_POINT_CONFIG}/fsap-config123/g" \
+              -e "s/\${EFS_ACCESS_POINT_HTML}/fsap-html456/g" \
+              task-definitions/nginx-task.json > /tmp/nginx-task-resolved.json
+
+          # Register the task definition
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/nginx-task-resolved.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      - name: Deploy ECS Service
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          echo "Deploying ECS Service..."
+          aws cloudformation deploy \
+            --stack-name ${{ env.SERVICE_STACK }} \
+            --template-file services/nginx-service.json \
+            --parameter-overrides \
+              ClusterStackName=${{ env.CLUSTER_STACK }} \
+              ALBStackName=${{ env.ALB_STACK }} \
+              VpcId=${{ steps.network.outputs.VPC_ID }} \
+              PrivateSubnets=${{ steps.network.outputs.PRIVATE_SUBNETS }} \
+              TaskDefinitionArn=${{ steps.task-def.outputs.TASK_DEF_ARN }} \
+              DesiredCount=2 \
+              MinCapacity=1 \
+              MaxCapacity=4 \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --tags Environment=Production ManagedBy=GitHubActions
+
+      - name: Get Load Balancer DNS
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          ALB_DNS=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.ALB_STACK }} \
+            --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerDNS'].OutputValue" \
+            --output text)
+
+          echo "🚀 Deployment completed successfully!"
+          echo "📡 Application available at:"
+          echo "  - HTTP: http://$ALB_DNS"
+          echo "  - Alternative port: http://$ALB_DNS:8080"
+          echo "  - HTTPS: https://$ALB_DNS (certificate required)"
+
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: failure()
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Rollback Service Stack
+        continue-on-error: true
+        run: |
+          aws cloudformation cancel-update-stack \
+            --stack-name ${{ env.SERVICE_STACK }}
+
+      - name: Notify rollback
+        run: |
+          echo "⚠️ Deployment failed. Rollback initiated."

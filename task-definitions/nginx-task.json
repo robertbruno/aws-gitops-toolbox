@@ -1,0 +1,148 @@
+{
+  "family": "nginx-service",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "nginx",
+      "image": "nginx:latest",
+      "cpu": 512,
+      "memory": 1024,
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "protocol": "tcp",
+          "name": "http"
+        },
+        {
+          "containerPort": 8080,
+          "protocol": "tcp",
+          "name": "http-alt"
+        },
+        {
+          "containerPort": 443,
+          "protocol": "tcp",
+          "name": "https"
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -f http://localhost/ || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "environment": [
+        {
+          "name": "NGINX_PORT",
+          "value": "80"
+        },
+        {
+          "name": "NGINX_ALT_PORT",
+          "value": "8080"
+        },
+        {
+          "name": "NGINX_SSL_PORT",
+          "value": "443"
+        }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "nginx-config",
+          "containerPath": "/etc/nginx/conf.d",
+          "readOnly": true
+        },
+        {
+          "sourceVolume": "nginx-html",
+          "containerPath": "/usr/share/nginx/html"
+        },
+        {
+          "sourceVolume": "nginx-logs",
+          "containerPath": "/var/log/nginx"
+        }
+      ],
+      "volumesFrom": [],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/nginx",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "nginx"
+        }
+      },
+      "linuxParameters": {
+        "capabilities": {
+          "add": [],
+          "drop": [
+            "ALL"
+          ]
+        },
+        "initProcessEnabled": true
+      },
+      "readonlyRootFilesystem": false,
+      "privileged": false,
+      "user": "nginx"
+    }
+  ],
+  "volumes": [
+    {
+      "name": "nginx-config",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "${EFS_ID}",
+        "rootDirectory": "/config",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "${EFS_ACCESS_POINT_CONFIG}",
+          "iam": "DISABLED"
+        }
+      }
+    },
+    {
+      "name": "nginx-html",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "${EFS_ID}",
+        "rootDirectory": "/html",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "${EFS_ACCESS_POINT_HTML}",
+          "iam": "DISABLED"
+        }
+      }
+    },
+    {
+      "name": "nginx-logs",
+      "host": {
+        "sourcePath": "/var/log/nginx"
+      }
+    }
+  ],
+  "placementConstraints": [],
+  "runtimePlatform": {
+    "operatingSystemFamily": "LINUX",
+    "cpuArchitecture": "X86_64"
+  },
+  "tags": [
+    {
+      "key": "Name",
+      "value": "nginx-task"
+    },
+    {
+      "key": "Environment",
+      "value": "Production"
+    },
+    {
+      "key": "Service",
+      "value": "nginx"
+    }
+  ]
+}

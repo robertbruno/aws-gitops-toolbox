@@ -1,0 +1,80 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "ECS Cluster for containerized applications",
+  "Parameters": {
+    "ClusterName": {
+      "Type": "String",
+      "Default": "nginx-cluster",
+      "Description": "Name of the ECS cluster"
+    },
+    "EnableContainerInsights": {
+      "Type": "String",
+      "Default": "enabled",
+      "AllowedValues": ["enabled", "disabled"],
+      "Description": "Enable Container Insights for monitoring"
+    }
+  },
+  "Resources": {
+    "ECSCluster": {
+      "Type": "AWS::ECS::Cluster",
+      "Properties": {
+        "ClusterName": {
+          "Ref": "ClusterName"
+        },
+        "ClusterSettings": [
+          {
+            "Name": "containerInsights",
+            "Value": {
+              "Ref": "EnableContainerInsights"
+            }
+          }
+        ],
+        "CapacityProviders": [
+          "FARGATE",
+          "FARGATE_SPOT"
+        ],
+        "DefaultCapacityProviderStrategy": [
+          {
+            "CapacityProvider": "FARGATE",
+            "Weight": 1,
+            "Base": 0
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Environment",
+            "Value": "Production"
+          },
+          {
+            "Key": "ManagedBy",
+            "Value": "CloudFormation"
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "ClusterName": {
+      "Description": "Name of the ECS Cluster",
+      "Value": {
+        "Ref": "ECSCluster"
+      },
+      "Export": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-ClusterName"
+        }
+      }
+    },
+    "ClusterArn": {
+      "Description": "ARN of the ECS Cluster",
+      "Value": {
+        "Fn::GetAtt": ["ECSCluster", "Arn"]
+      },
+      "Export": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-ClusterArn"
+        }
+      }
+    }
+  }
+}
